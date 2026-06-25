@@ -1,234 +1,221 @@
 import axios from 'axios';
 import cron from 'node-cron';
-import nodemailer from 'nodemailer';
+import cliProgress from 'cli-progress';
+import chalk from 'chalk';
 
 // ==========================================
-// 1. CONFIGURAÇÕES
+// CONFIGURAÇÕES
 // ==========================================
-
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: 'tiqualiport@gmail.com',
-    pass: 'dhxp ftrm sljc resq' 
-  }
-});
-const EMAIL_ALERTA_DESTINO = 'ti@qualiport.com.br';
-
 const UNIFI_API_URL = 'https://api.ui.com/v1/hosts';
 const UNIFI_API_KEY = '4aIypKqJoWGE9YJnSywr7gHTsuuWCcOi';
 
 const AUVO_API_KEY = '6Dg9SRzN3EivhKG1rZwjRYKQlfbntajh';
 const AUVO_API_TOKEN = '6Dg9SRzN3Ejr8tmzIYkpTZB352cUqVK';
 
-// ---------------------------------------------------------
-// PARÂMETROS AJUSTADOS (IDs do Auvo)
-// ---------------------------------------------------------
-const ID_CLIENTE_PADRAO = 14248700; 
-const ID_TIPO_CHAMADO = 0;          // ⬅️ COLOQUE AQUI O ID DO TIPO
-const ID_STATUS_OFFLINE = 108504;    // ⬅️ COLOQUE AQUI O ID DO STATUS "Unify Offline" (Ex: antigo 95495)
-const ID_STATUS_ONLINE = 108505;     // ⬅️ COLOQUE AQUI O ID DO STATUS "Unify Online"
+const ID_STATUS_OFFLINE = 108504; 
+const ID_STATUS_ONLINE = 108505; 
+const ID_CLIENTE_PADRAO = 14248700;
 
 let auvoAccessToken = null;
 let auvoTokenExpiration = 0;
 
-// Caches de estado
-const offlineGatewaysCache = new Map();   // Guarda { ticketId, openedAt }
-const pendingValidationCache = new Set(); // Guarda IDs pendentes para a validação de 5 min
+const offlineGatewaysCache = new Map();
+const pendingValidationCache = new Set();
+const promisesEmAndamento = new Set();
 
 // ==========================================
-// 2. FUNÇÕES ÚTEIS
+// FUNÇÕES ÚTEIS
 // ==========================================
-
 function getHorario() {
   return new Date().toLocaleTimeString('pt-BR');
 }
 
-// Converte os milissegundos de inatividade para um formato legível (Ex: 1h 5m 30s)
-function formatarTempoOffline(ms) {
-  const segundos = Math.floor((ms / 1000) % 60);
-  const minutos = Math.floor((ms / (1000 * 60)) % 60);
-  const horas = Math.floor((ms / (1000 * 60 * 60)) % 24);
-
-  const partes = [];
-  if (horas > 0) partes.push(`${horas}h`);
-  if (minutos > 0) partes.push(`${minutos}m`);
-  if (segundos > 0 || partes.length === 0) partes.push(`${segundos}s`);
-
-  return partes.join(' ');
-}
-
 // ==========================================
-// 3. INTEGRAÇÕES DE API
+// FUNÇÕES DE API
 // ==========================================
 
 async function getAuvoToken() {
   const agora = Date.now();
   if (auvoAccessToken && agora < auvoTokenExpiration - (2 * 60 * 1000)) return auvoAccessToken;
   
-  try {
-    const response = await axios.post('https://api.auvo.com.br/v2/login', {
-      apiKey: AUVO_API_KEY,
-      apiToken: AUVO_API_TOKEN
-    });
-    auvoAccessToken = response.data.result.accessToken;
-    auvoTokenExpiration = agora + (30 * 60 * 1000); 
-    return auvoAccessToken;
-  } catch (error) {
-    throw new Error(error.message);
-  }
+  const response = await axios.post('https://api.auvo.com.br/v2/login', { 
+    apiKey: AUVO_API_KEY, 
+    apiToken: AUVO_API_TOKEN 
+  });
+  auvoAccessToken = response.data.result.accessToken;
+  auvoTokenExpiration = agora + (30 * 60 * 1000);
+  return auvoAccessToken;
 }
 
-async function openAuvoTicket(gateway) {
+// Abre o ticket com status Unifi Offline
+async function openAuvoTicket(gateway, logsDoCiclo) {
   const nomeGateway = gateway.reportedState?.name || 'Desconhecido';
+  const token = await getAuvoToken();
   
-  try {
-    const token = await getAuvoToken();
-    
-    const ticketData = {
-      title: `Condomínio ${nomeGateway} Offline`,
-      description: `O Gateway "${nomeGateway}" perdeu a comunicação com o Site Manager.`,
-      priority: 3,
-      requestTypeId: ID_TIPO_CHAMADO, 
-      statusId: ID_STATUS_OFFLINE,  // Usando o status "Unify Offline"    
-      customerId: ID_CLIENTE_PADRAO,
-      requesterName: `Monitoramento - ${nomeGateway}`,
-      requesterEmail: "ti@qualiport.com.br"
-    };
+  const ticketData = {
+    customerId: ID_CLIENTE_PADRAO,
+    title: `Alerta: Gateway ${nomeGateway} Offline`,
+    description: `O dispositivo ${nomeGateway} perdeu conexão com o Site Manager.`,
+    statusId: ID_STATUS_OFFLINE,
+    priority: 3
+  };
 
+  try {
     const response = await axios.post('https://api.auvo.com.br/v2/tickets', ticketData, {
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
     });
 
-    const ticketId = response.data?.result?.ticketID || response.data?.result?.id;
-
-    if (ticketId) {
-      console.log(`[${getHorario()}] [Sucesso] Ticket #${ticketId} aberto para: ${nomeGateway}`);
-      offlineGatewaysCache.set(gateway.id, { ticketId: ticketId, openedAt: Date.now() });
-    } else {
-      console.log(`[${getHorario()}] [Atenção] Ticket aberto, mas não foi possível capturar o ID da resposta.`);
-      offlineGatewaysCache.set(gateway.id, { ticketId: null, openedAt: Date.now() });
-    }
-    
+    const taskId = response.data.result.id;
+    offlineGatewaysCache.set(gateway.id, { taskId, name: nomeGateway, openedAt: Date.now() });
     pendingValidationCache.delete(gateway.id);
-
+    
+    logsDoCiclo.push(chalk.red(`[!] Ticket #${taskId} aberto para ${nomeGateway}`));
   } catch (error) {
-    console.error(`[${getHorario()}] [Erro] Falha ao abrir ticket para ${nomeGateway}:`, error.message);
+    logsDoCiclo.push(chalk.bgRed.white(`[Erro Abertura] Falha ao abrir ticket para ${nomeGateway}: ${error.message}`));
   }
 }
 
-async function updateAuvoTicket(ticketId, nomeGateway, tempoOfflineMs) {
+// APENAS atualiza o status para Unifi Online (sem adicionar notas)
+async function updateAuvoTicket(cacheData, nomeGateway, logsDoCiclo) {
   const token = await getAuvoToken();
-  const tempoFormatado = formatarTempoOffline(tempoOfflineMs);
-  const horarioRecuperacao = getHorario();
   
-  // ===============================================
-  // 1. ALTERA O STATUS DO TICKET (PATCH)
-  // ===============================================
   try {
-    await axios.patch(`https://api.auvo.com.br/v2/tickets/${ticketId}`, {
-      statusId: ID_STATUS_ONLINE // Muda para o status "Unify Online"
-    }, {
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
-    });
-    console.log(`[${getHorario()}] [Sucesso] Ticket #${ticketId} movido para status "Unify Online".`);
+    await axios.patch(`https://api.auvo.com.br/v2/tickets/${cacheData.taskId}`, 
+      { statusId: ID_STATUS_ONLINE }, 
+      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+    
+    logsDoCiclo.push(chalk.green(`[✓] Ticket #${cacheData.taskId} (${nomeGateway}) atualizado para Unifi Online.`));
   } catch (error) {
-    const detalheErro = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    console.error(`[${getHorario()}] [Erro no Status] Status ${error.response?.status}. Detalhe: ${detalheErro}`);
-  }
-
-  // ===============================================
-  // 2. ADICIONA A NOTA COM O TEMPO OFFLINE
-  // ===============================================
-  try {
-    await axios.post(`https://api.auvo.com.br/v2/tickets/${ticketId}/notes`, {
-      note: `Equipamento normalizado às ${horarioRecuperacao}. O gateway ficou offline por um período total de ${tempoFormatado}.`
-    }, {
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
-    });
-    console.log(`[${getHorario()}] [Sucesso] Nota com o tempo de inatividade inserida no ticket #${ticketId}.`);
-  } catch (error) {
-    const detalheErro = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    console.error(`[${getHorario()}] [Erro na Nota] Status ${error.response?.status}. Detalhe: ${detalheErro}`);
+    logsDoCiclo.push(chalk.bgRed.white(`[Erro Atualização] Ticket #${cacheData.taskId}: ${error.message}`));
   }
 }
 
 // ==========================================
-// 4. LÓGICA PRINCIPAL (MONITORAMENTO)
+// LÓGICA DE MONITORAMENTO E VISUALIZAÇÃO
 // ==========================================
 
 async function checkUnifiStatus() {
-  console.log(`\n[${getHorario()}] [UniFi] 📡 Iniciando consulta de Gateways...`);
+  if (promisesEmAndamento.size > 0) return;
+  promisesEmAndamento.add('running');
   
+  console.log(chalk.cyan(`\n=================================================`));
+  console.log(chalk.cyan.bold(`📡 [${getHorario()}] INICIANDO CICLO DE VARREDURA`));
+  console.log(chalk.cyan(`=================================================`));
+
   try {
-    const response = await axios.get(UNIFI_API_URL, {
-      headers: { 'X-API-KEY': UNIFI_API_KEY, 'Accept': 'application/json' },
-      timeout: 10000 
+    const response = await axios.get(UNIFI_API_URL, { headers: { 'X-API-KEY': UNIFI_API_KEY } });
+    const todosGateways = response.data.data || [];
+    
+    // FILTRO: Remove todos os gateways que contenham a palavra "IMPLANTACAO" (ignorando maiúsculas/minúsculas)
+    const gateways = todosGateways.filter(gw => {
+      const nome = gw.reportedState?.name || '';
+      return !nome.toUpperCase().includes('IMPLANTACAO');
     });
 
-    const gateways = response.data.data || [];
-    
-    const promessas = gateways.map(async (gateway) => {
-      const estado = (gateway.reportedState?.state || '').toLowerCase();
-      const nome = gateway.reportedState?.name || 'Desconhecido';
+    const totalGateways = gateways.length;
+
+    if (totalGateways === 0) {
+      console.log(chalk.yellow("Nenhum gateway monitorável encontrado na controladora."));
+      promisesEmAndamento.delete('running');
+      return;
+    }
+
+    const progressBar = new cliProgress.SingleBar({
+      format: 'Progresso |' + chalk.blue('{bar}') + '| {percentage}% || {value}/{total} Gateways',
+      barCompleteChar: '\u2588',
+      barIncompleteChar: '\u2591',
+      hideCursor: true
+    });
+
+    progressBar.start(totalGateways, 0);
+
+    let countOnline = 0;
+    let countOffline = 0;
+    const logsDoCiclo = []; 
+
+    for (const gateway of gateways) {
+      const isOffline = (gateway.reportedState?.state === 'offline' || gateway.reportedState?.state === 'disconnected');
       
-      // Validação de Implantação
-      const nomeUpper = nome.toUpperCase();
-      const isImplantacao = nomeUpper.includes('IMPLATACAO') || 
-                            nomeUpper.includes('IMPLANTACAO') || 
-                            nomeUpper.includes('IMPLANTAÇÃO');
-
-      const isOffline = (estado === 'disconnected' || estado === 'offline') && !isImplantacao;
-
-      if (isImplantacao && (estado === 'disconnected' || estado === 'offline')) {
-        console.log(`[${getHorario()}] [Ignorado] 🚧 ${nome} está offline, mas em fase de implantação.`);
-      }
-
       if (isOffline) {
-        // --- CENÁRIO OFFLINE ---
-        if (offlineGatewaysCache.has(gateway.id)) {
-          return; // Ticket já aberto
-        } else if (pendingValidationCache.has(gateway.id)) {
-          console.log(`[${getHorario()}] [Confirmado] 🔴 ${nome} validado como offline. Abrindo ticket...`);
-          await openAuvoTicket(gateway);
+        countOffline++;
+        if (!offlineGatewaysCache.has(gateway.id)) {
+          // Processa abertura aguardando os 5 minutos de validação
+          if (pendingValidationCache.has(gateway.id)) {
+            await openAuvoTicket(gateway, logsDoCiclo);
+          } else {
+            pendingValidationCache.add(gateway.id);
+          }
         } else {
-          console.log(`[${getHorario()}] [Atenção] 🟡 ${nome} detectado offline. Aguardando validação de 5 minutos...`);
-          pendingValidationCache.add(gateway.id);
+          // CHECAGEM DE 1 HORA (3.600.000 ms)
+          const cacheData = offlineGatewaysCache.get(gateway.id);
+          const tempoOffline = Date.now() - cacheData.openedAt;
+          
+          if (tempoOffline > 3600000) {
+            // Passou de 1 hora. Remove da memória para não tentar atualizar mais.
+            offlineGatewaysCache.delete(gateway.id);
+            logsDoCiclo.push(chalk.yellow(`[Tempo Limite] ${cacheData.name} offline há > 1h. Ticket #${cacheData.taskId} ignorado p/ ação manual.`));
+          }
         }
       } else {
-        // --- CENÁRIO ONLINE ---
-        if (pendingValidationCache.has(gateway.id)) {
-          console.log(`[${getHorario()}] [Recuperação Rápida] 🟢 ${nome} voltou antes da abertura do ticket!`);
-          pendingValidationCache.delete(gateway.id);
-        }
-        
+        countOnline++;
         if (offlineGatewaysCache.has(gateway.id)) {
+          // Voltou antes de 1 hora: altera status para Online
           const cacheData = offlineGatewaysCache.get(gateway.id);
-          const tempoOfflineMs = Date.now() - cacheData.openedAt;
-
-          if (cacheData.ticketId) {
-            console.log(`[${getHorario()}] [Recuperação] 🟢 ${nome} voltou! Atualizando o ticket #${cacheData.ticketId}...`);
-            await updateAuvoTicket(cacheData.ticketId, nome, tempoOfflineMs);
-          } else {
-            console.log(`[${getHorario()}] [Recuperação] 🟢 ${nome} voltou, mas não possui ID registrado para atualizar o ticket.`);
-          }
-          
-          offlineGatewaysCache.delete(gateway.id); // Remove do cache de quedas
+          await updateAuvoTicket(cacheData, gateway.reportedState.name, logsDoCiclo);
+          offlineGatewaysCache.delete(gateway.id);
         }
+        pendingValidationCache.delete(gateway.id);
       }
-    });
+      
+      progressBar.increment();
+    }
 
-    await Promise.all(promessas);
-    console.log(`[${getHorario()}] [Resumo] Processamento concluído com sucesso.`);
+    progressBar.stop();
 
-  } catch (error) {
-    console.error(`[${getHorario()}] [Erro no Ciclo]:`, error.message);
+    // ==========================================
+    // IMPRESSÃO DOS EVENTOS DO CICLO
+    // ==========================================
+    if (logsDoCiclo.length > 0) {
+      console.log(); 
+      logsDoCiclo.forEach(log => console.log(log));
+    }
+
+    // ==========================================
+    // DASHBOARD RESUMO DO CICLO
+    // ==========================================
+    console.log(chalk.bold(`\n📊 RESUMO DO CICLO:`));
+    console.log(chalk.green(`🟢 Online/Conectados: ${countOnline}`));
+    console.log(chalk.red(`🔴 Offline/Desconectados: ${countOffline}`));
+    console.log(chalk.yellow(`🟡 Validações Pendentes (Aguardando 5 min): ${pendingValidationCache.size}`));
+    
+    if (offlineGatewaysCache.size > 0) {
+      console.log(chalk.red.bold(`\n⚠️  TICKETS ABERTOS NO MOMENTO (Observação de 1h):`));
+      const tabelaOffline = [];
+      
+      offlineGatewaysCache.forEach((data) => {
+        const tempoCaiu = new Date(data.openedAt).toLocaleTimeString('pt-BR');
+        tabelaOffline.push({
+          'Gateway': data.name,
+          'Ticket Auvo': `#${data.taskId}`,
+          'Caiu às': tempoCaiu
+        });
+      });
+      
+      console.table(tabelaOffline);
+    } else {
+      console.log(chalk.green(`\n✨ Nenhum ticket aberto em janela de observação.`));
+    }
+
+  } catch (e) {
+    console.log(chalk.bgRed.white(`\n❌ ERRO FATAL NO CICLO: ${e.message}`));
+  } finally {
+    promisesEmAndamento.delete('running');
   }
 }
 
-// Início
-console.log('Monitoramento Iniciado...');
+// Executa a primeira vez imediatamente
 checkUnifiStatus();
+
+// Agenda para rodar a cada 5 minutos
 cron.schedule('*/5 * * * *', () => checkUnifiStatus());
