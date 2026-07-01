@@ -2,9 +2,11 @@ import axios from 'axios';
 import cron from 'node-cron';
 import cliProgress from 'cli-progress';
 import chalk from 'chalk';
+import googleapis from 'googleapis';
+const { google } = googleapis;
 
 // ==========================================
-// CONFIGURAÇÕES
+// CONFIGURAÇÕES DE API
 // ==========================================
 const UNIFI_API_URL = 'https://api.ui.com/v1/hosts';
 const UNIFI_API_KEY = '4aIypKqJoWGE9YJnSywr7gHTsuuWCcOi';
@@ -14,8 +16,18 @@ const AUVO_API_TOKEN = '6Dg9SRzN3Ejr8tmzIYkpTZB352cUqVK';
 
 const ID_STATUS_OFFLINE = 108504; 
 const ID_STATUS_ONLINE = 108505; 
-const ID_CLIENTE_PADRAO = 14248700;
+const ID_CLIENTE_PADRAO = 14248700; // Cliente Teste caso não encontre na planilha
 
+// ==========================================
+// CONFIGURAÇÃO SEGURA DO GOOGLE SHEETS
+// ==========================================
+// Substitui pelo ID que está na URL da tua planilha: https://docs.google.com/spreadsheets/d/ID_AQUI/edit
+const ID_DA_PLANILHA = '1zoJ3r3CTik6ceDzcaR-TH0bnWbdwjKGYTRyK6x8yS70'; 
+const NOME_DA_ABA = 'Página1'; // Nome exato da aba no Sheets (ex: 'Página1' ou 'Sheet1')
+
+// ==========================================
+// VARIÁVEIS DE CONTROLO E CACHE
+// ==========================================
 let auvoAccessToken = null;
 let auvoTokenExpiration = 0;
 
@@ -30,10 +42,6 @@ function getHorario() {
   return new Date().toLocaleTimeString('pt-BR');
 }
 
-// ==========================================
-// FUNÇÕES DE API
-// ==========================================
-
 async function getAuvoToken() {
   const agora = Date.now();
   if (auvoAccessToken && agora < auvoTokenExpiration - (2 * 60 * 1000)) return auvoAccessToken;
@@ -47,13 +55,60 @@ async function getAuvoToken() {
   return auvoAccessToken;
 }
 
-// Abre o ticket com status Unifi Offline
-async function openAuvoTicket(gateway, logsDoCiclo) {
+// ==========================================
+// FUNÇÃO: LER PLANILHA PRIVADA (GOOGLE API)
+// ==========================================
+async function obterTabelaDaPlanilha() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: './credenciais-google.json', // Procura o ficheiro de chaves baixado do GCP
+      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    });
+
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: ID_DA_PLANILHA,
+      range: `${NOME_DA_ABA}!A:C`, // Lê as colunas A (nomeGateway), B (nomeAuvo) e C (idAuvo)
+    });
+
+    const linhas = response.data.values;
+    const mapa = [];
+
+    if (!linhas || linhas.length <= 1) return [];
+
+    // Começa em 1 para ignorar a linha de cabeçalho da planilha
+    for (let i = 1; i < linhas.length; i++) {
+      const colunas = linhas[i];
+      if (colunas && colunas.length >= 3 && colunas[0].trim() !== '') {
+        mapa.push({
+          nomeGateway: colunas[0].trim(),
+          nomeAuvo: colunas[1].trim(),
+          idAuvo: parseInt(colunas[2].trim(), 10)
+        });
+      }
+    }
+    return mapa;
+  } catch (error) {
+    console.log(chalk.red(`[Erro Planilha] Falha segura ao ler dados do Sheets: ${error.message}`));
+    return []; // Retorna array vazio para o ciclo de monitorização não quebrar
+  }
+}
+
+// ==========================================
+// FUNÇÕES DE MANIPULAÇÃO DE TICKETS
+// ==========================================
+
+async function openAuvoTicket(gateway, logsDoCiclo, tabelaLive) {
   const nomeGateway = gateway.reportedState?.name || 'Desconhecido';
   const token = await getAuvoToken();
   
+  // Procura a linha correspondente na tabela obtida da planilha
+  const linhaEncontrada = tabelaLive.find(linha => linha.nomeGateway === nomeGateway);
+  const idDoCliente = linhaEncontrada ? linhaEncontrada.idAuvo : ID_CLIENTE_PADRAO;
+  
   const ticketData = {
-    customerId: ID_CLIENTE_PADRAO,
+    customerId: idDoCliente,
     title: `Alerta: Gateway ${nomeGateway} Offline`,
     description: `O dispositivo ${nomeGateway} perdeu conexão com o Site Manager.`,
     statusId: ID_STATUS_OFFLINE,
@@ -69,22 +124,20 @@ async function openAuvoTicket(gateway, logsDoCiclo) {
     offlineGatewaysCache.set(gateway.id, { taskId, name: nomeGateway, openedAt: Date.now() });
     pendingValidationCache.delete(gateway.id);
     
-    logsDoCiclo.push(chalk.red(`[!] Ticket #${taskId} aberto para ${nomeGateway}`));
+    const destinoLog = linhaEncontrada ? linhaEncontrada.nomeAuvo : "Cliente Teste (Não listado no Sheets)";
+    logsDoCiclo.push(chalk.red(`[!] Ticket #${taskId} aberto para ${nomeGateway} -> Destino: ${destinoLog}`));
   } catch (error) {
     logsDoCiclo.push(chalk.bgRed.white(`[Erro Abertura] Falha ao abrir ticket para ${nomeGateway}: ${error.message}`));
   }
 }
 
-// APENAS atualiza o status para Unifi Online (sem adicionar notas)
 async function updateAuvoTicket(cacheData, nomeGateway, logsDoCiclo) {
   const token = await getAuvoToken();
-  
   try {
     await axios.patch(`https://api.auvo.com.br/v2/tickets/${cacheData.taskId}`, 
       { statusId: ID_STATUS_ONLINE }, 
       { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
     );
-    
     logsDoCiclo.push(chalk.green(`[✓] Ticket #${cacheData.taskId} (${nomeGateway}) atualizado para Unifi Online.`));
   } catch (error) {
     logsDoCiclo.push(chalk.bgRed.white(`[Erro Atualização] Ticket #${cacheData.taskId}: ${error.message}`));
@@ -92,7 +145,7 @@ async function updateAuvoTicket(cacheData, nomeGateway, logsDoCiclo) {
 }
 
 // ==========================================
-// LÓGICA DE MONITORAMENTO E VISUALIZAÇÃO
+// LÓGICA PRINCIPAL DE VERIFICAÇÃO
 // ==========================================
 
 async function checkUnifiStatus() {
@@ -104,10 +157,13 @@ async function checkUnifiStatus() {
   console.log(chalk.cyan(`=================================================`));
 
   try {
+    // 1. Descarrega a versão mais recente da planilha de forma autenticada e segura
+    const tabelaLive = await obterTabelaDaPlanilha();
+
+    // 2. Procura os hosts no Unifi Site Manager
     const response = await axios.get(UNIFI_API_URL, { headers: { 'X-API-KEY': UNIFI_API_KEY } });
     const todosGateways = response.data.data || [];
     
-    // FILTRO: Remove todos os gateways que contenham a palavra "IMPLANTACAO" (ignorando maiúsculas/minúsculas)
     const gateways = todosGateways.filter(gw => {
       const nome = gw.reportedState?.name || '';
       return !nome.toUpperCase().includes('IMPLANTACAO');
@@ -140,19 +196,17 @@ async function checkUnifiStatus() {
       if (isOffline) {
         countOffline++;
         if (!offlineGatewaysCache.has(gateway.id)) {
-          // Processa abertura aguardando os 5 minutos de validação
           if (pendingValidationCache.has(gateway.id)) {
-            await openAuvoTicket(gateway, logsDoCiclo);
+            // Envia a tabela atualizada para a função de abertura
+            await openAuvoTicket(gateway, logsDoCiclo, tabelaLive);
           } else {
             pendingValidationCache.add(gateway.id);
           }
         } else {
-          // CHECAGEM DE 1 HORA (3.600.000 ms)
           const cacheData = offlineGatewaysCache.get(gateway.id);
           const tempoOffline = Date.now() - cacheData.openedAt;
           
           if (tempoOffline > 3600000) {
-            // Passou de 1 hora. Remove da memória para não tentar atualizar mais.
             offlineGatewaysCache.delete(gateway.id);
             logsDoCiclo.push(chalk.yellow(`[Tempo Limite] ${cacheData.name} offline há > 1h. Ticket #${cacheData.taskId} ignorado p/ ação manual.`));
           }
@@ -160,7 +214,6 @@ async function checkUnifiStatus() {
       } else {
         countOnline++;
         if (offlineGatewaysCache.has(gateway.id)) {
-          // Voltou antes de 1 hora: altera status para Online
           const cacheData = offlineGatewaysCache.get(gateway.id);
           await updateAuvoTicket(cacheData, gateway.reportedState.name, logsDoCiclo);
           offlineGatewaysCache.delete(gateway.id);
@@ -173,17 +226,11 @@ async function checkUnifiStatus() {
 
     progressBar.stop();
 
-    // ==========================================
-    // IMPRESSÃO DOS EVENTOS DO CICLO
-    // ==========================================
     if (logsDoCiclo.length > 0) {
       console.log(); 
       logsDoCiclo.forEach(log => console.log(log));
     }
 
-    // ==========================================
-    // DASHBOARD RESUMO DO CICLO
-    // ==========================================
     console.log(chalk.bold(`\n📊 RESUMO DO CICLO:`));
     console.log(chalk.green(`🟢 Online/Conectados: ${countOnline}`));
     console.log(chalk.red(`🔴 Offline/Desconectados: ${countOffline}`));
@@ -192,16 +239,13 @@ async function checkUnifiStatus() {
     if (offlineGatewaysCache.size > 0) {
       console.log(chalk.red.bold(`\n⚠️  TICKETS ABERTOS NO MOMENTO (Observação de 1h):`));
       const tabelaOffline = [];
-      
       offlineGatewaysCache.forEach((data) => {
-        const tempoCaiu = new Date(data.openedAt).toLocaleTimeString('pt-BR');
         tabelaOffline.push({
           'Gateway': data.name,
           'Ticket Auvo': `#${data.taskId}`,
-          'Caiu às': tempoCaiu
+          'Caiu às': new Date(data.openedAt).toLocaleTimeString('pt-BR')
         });
       });
-      
       console.table(tabelaOffline);
     } else {
       console.log(chalk.green(`\n✨ Nenhum ticket aberto em janela de observação.`));
@@ -214,8 +258,8 @@ async function checkUnifiStatus() {
   }
 }
 
-// Executa a primeira vez imediatamente
+// Execução inicial imediata
 checkUnifiStatus();
 
-// Agenda para rodar a cada 5 minutos
+// Agendamento de 5 em 5 minutos
 cron.schedule('*/5 * * * *', () => checkUnifiStatus());
